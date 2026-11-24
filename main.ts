@@ -17,9 +17,10 @@
 //   2. Copies promo.png — the photo made for the post, generated in the
 //      session that built this entry — to /output/promo.png, after
 //      checking it is a whole PNG of the size the post was made with
-//      (magic bytes, the IHDR dimensions, and the IEND trailer), so a
-//      truncated or swapped file fails loudly here instead of silently
-//      shipping a broken picture.
+//      (magic bytes, the IHDR dimensions and its CRC, and the IEND
+//      trailer with its CRC), so a truncated, swapped or silently
+//      corrupted file fails loudly here instead of silently shipping a
+//      broken picture.
 //   3. Prints the SHA-256 of the photo it shipped, so the run log proves
 //      which picture the entry stands behind.
 //
@@ -42,6 +43,44 @@ const PNG_MAGIC = 0x89504e47;
 // The photo attached to the post, as generated: 2048x1152.
 const PROMO_WIDTH = 2048;
 const PROMO_HEIGHT = 1152;
+
+// CRC32, zlib polynomial, table-based. A PNG stores the CRC of each
+// chunk's type plus its data, so a chunk that still has the right name
+// and dimensions but a corrupted payload is caught here.
+const CRC_TABLE: number[] = (() => {
+  const table: number[] = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(data: Buffer): number {
+  let c = 0xffffffff;
+  for (const byte of data) {
+    c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Check a chunk's stored CRC against the CRC computed over its type and
+// data. The chunk starts at chunkOffset with the layout: 4-byte length,
+// 4-byte type, data, 4-byte stored CRC.
+function checkChunkCrc(picture: Buffer, chunkOffset: number, name: string, path: string): void {
+  const length = picture.readUInt32BE(chunkOffset);
+  const dataEnd = chunkOffset + 8 + length;
+  const stored = picture.readUInt32BE(dataEnd);
+  const computed = crc32(picture.subarray(chunkOffset + 4, dataEnd));
+  if (computed !== stored) {
+    throw new Error(
+      `${path} has a bad ${name} chunk CRC (stored ${stored.toString(16)}, computed ${computed.toString(16)})`,
+    );
+  }
+}
 
 function readPostJson(path: string): Buffer {
   const raw = readFileSync(path);
@@ -75,6 +114,9 @@ function readWholePng(path: string): Buffer {
   if (width !== PROMO_WIDTH || height !== PROMO_HEIGHT) {
     throw new Error(`${path} is ${width}x${height}, expected ${PROMO_WIDTH}x${PROMO_HEIGHT}`);
   }
+  // The stored CRC covers the chunk type and data, so a corrupted IHDR
+  // payload is caught even when the dimensions still read right.
+  checkChunkCrc(picture, 8, 'IHDR', path);
   // A PNG that lost its tail in transit still starts with the right
   // magic, so check the IEND trailer too: the last 12 bytes of a whole
   // PNG are the empty IEND chunk (length 0, "IEND", and its CRC).
@@ -84,6 +126,9 @@ function readWholePng(path: string): Buffer {
   if (!whole) {
     throw new Error(`${path} is a truncated PNG (no IEND trailer)`);
   }
+  // The IEND CRC is a fixed constant, but verifying it the same way
+  // keeps the check honest if the trailer bytes were ever tampered with.
+  checkChunkCrc(picture, picture.length - 12, 'IEND', path);
   return picture;
 }
 
